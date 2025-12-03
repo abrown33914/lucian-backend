@@ -120,7 +120,7 @@ Predicts:
 
 ## ⚙️ **Azure Functions Implemented**
 
-### ### ✅ **1. Traffic Collector (Timer – every 5 minutes)**
+### ✅ **1. Traffic Collector (Timer – every 5 minutes)**
 
 **Function:** `collect_fort_myers`
 

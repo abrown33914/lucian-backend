@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+     <meta charset="UTF-8">
+     <title>Fort Myers Traffic Heatmap</title>
+     <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+     <style>
+          body {
+               margin: 0;
+               padding: 0;
+          }
+
+          #map {
+               width: 100%;
+               height: 100vh;
+          }
+
+          #fileInput {
+               position: absolute;
+               top: 10px;
+               left: 10px;
+               z-index: 1000;
+               background: white;
+               padding: 5px;
+               border-radius: 4px;
+          }
+     </style>
+</head>
+
+<body>
+     <input type="file" id="fileInput" accept=".json">
+     <div id="map"></div>
+
+     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+     <script>
+          let map = L.map('map').setView([26.4515, -81.8106], 12);
+
+          L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+               attribution: '&copy; OpenStreetMap contributors'
+          }).addTo(map);
+
+          const fileInput = document.getElementById('fileInput');
+
+          function speedColor(current, freeFlow) {
+               const ratio = current / freeFlow;
+               if (ratio > 0.8) return 'green';
+               else if (ratio > 0.5) return 'orange';
+               else return 'red';
+          }
+
+          fileInput.addEventListener('change', function (event) {
+               const file = event.target.files[0];
+               if (!file) return;
+
+               const reader = new FileReader();
+               reader.onload = function (e) {
+                    try {
+                         const data = JSON.parse(e.target.result);
+                         const items = data.items || [];
+
+                         items.forEach(item => {
+                              const coords = item.data.flowSegmentData.coordinates.coordinate.map(c => [c.latitude, c.longitude]);
+                              const color = speedColor(item.data.flowSegmentData.currentSpeed, item.data.flowSegmentData.freeFlowSpeed);
+
+                              L.polyline(coords, { color: color, weight: 4, opacity: 0.7 })
+                                   .bindPopup(`FRC: ${item.data.flowSegmentData.frc}<br>Speed: ${item.data.flowSegmentData.currentSpeed} / ${item.data.flowSegmentData.freeFlowSpeed} mph`)
+                                   .addTo(map);
+                         });
+
+                         if (items.length > 0) {
+                              // Fit map to bounds of all segments
+                              const allCoords = items.flatMap(item => item.data.flowSegmentData.coordinates.coordinate.map(c => [c.latitude, c.longitude]));
+                              map.fitBounds(allCoords);
+                         }
+                    } catch (err) {
+                         alert('Invalid JSON file');
+                         console.error(err);
+                    }
+               };
+               reader.readAsText(file);
+          });
+     </script>
+</body>
+
+</html>

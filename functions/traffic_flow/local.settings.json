@@ -1,0 +1,14 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AZURE_MAPS_SUBSCRIPTION_KEY": "",
+    "TRAFFIC_CONTAINER": "traffic-flow",
+    "FORT_MYERS_LAT": "26.4515",
+    "FORT_MYERS_LON": "-81.8106",
+    "FORT_MYERS_LAT_SPAN": "0.35",
+    "FORT_MYERS_LON_SPAN": "0.35",
+    "FORT_MYERS_GRID_STEPS": "6"
+  }
+}

@@ -3,11 +3,7 @@ requests
 azure-identity
 azure-digitaltwins-core
 azure-core
-azure-functions
-azure-identity
 azure-storage-blob
-requests
-
 joblib
 scikit-learn
 numpy

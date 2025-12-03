@@ -30,6 +30,49 @@ def _get_env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v else default
 
+# -------------------- Blob listing utilities for API -------------------- #
+def _blob_service() -> BlobServiceClient:
+    conn = os.getenv("AzureWebJobsStorage", "").strip()
+    if not conn:
+        raise RuntimeError("AzureWebJobsStorage is not configured")
+    return BlobServiceClient.from_connection_string(conn)
+
+def _list_json_blobs(container: str, prefix: str = "") -> List[str]:
+    svc = _blob_service()
+    cc = svc.get_container_client(container)
+    names = []
+    for b in cc.list_blobs(name_starts_with=prefix):
+        if b.name.endswith(".json"):
+            names.append(b.name)
+    return names
+
+def _read_blob_json(container: str, name: str) -> dict:
+    svc = _blob_service()
+    bc = svc.get_blob_client(container=container, blob=name)
+    data = bc.download_blob().readall()
+    return json.loads(data.decode("utf-8"))
+
+def _summarize_payload(payload: dict) -> dict:
+    items = payload.get("items", [])
+    timestamp = payload.get("timestamp")
+    count = len(items)
+    jams = []
+    delays = []
+    for it in items:
+        fsd = (it.get("data") or {}).get("flowSegmentData", {})
+        jf = fsd.get("jamFactor")
+        dr = fsd.get("delayRatio")
+        if isinstance(jf, (int, float)):
+            jams.append(float(jf))
+        if isinstance(dr, (int, float)):
+            delays.append(float(dr))
+    return {
+        "timestamp": timestamp,
+        "count": count,
+        "jamFactorAvg": (sum(jams) / len(jams)) if jams else None,
+        "delayRatioAvg": (sum(delays) / len(delays)) if delays else None,
+    }
+
 
 def build_query_url(lat: float, lon: float, subscription_key: str, zoom: int) -> str:
     """Build Azure Maps Traffic Flow Segment URL for a given point."""
@@ -1302,3 +1345,194 @@ def scheduled_pavement_forecast(timer_pavement_forecast: func.TimerRequest) -> N
         f">>> [PAVEMENT FORECAST TIMER] Result: updated={result.get('updated')}, "
         f"errors={result.get('errors')}"
     )
+
+# -------------------- Traffic data API (Blob-backed) -------------------- #
+@app.route(route="traffic/latest", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_traffic_latest(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        container = _get_env("TRAFFIC_CONTAINER", "traffic")
+        prefix = req.params.get("prefix", "fortmyers/")
+        names = _list_json_blobs(container, prefix)
+        if not names:
+            return func.HttpResponse("No data", status_code=404)
+        names.sort()
+        latest = names[-1]
+        payload = _read_blob_json(container, latest)
+        summary = _summarize_payload(payload)
+        summary["blobPath"] = latest
+        return func.HttpResponse(json.dumps(summary), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"traffic/latest failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="traffic/history", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_traffic_history(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        container = _get_env("TRAFFIC_CONTAINER", "traffic")
+        prefix = req.params.get("prefix", "fortmyers/")
+        limit = int(req.params.get("limit", "10"))
+        names = _list_json_blobs(container, prefix)
+        if not names:
+            return func.HttpResponse("No data", status_code=404)
+        names.sort()
+        names = names[-limit:]
+        records = []
+        for n in names:
+            try:
+                payload = _read_blob_json(container, n)
+                records.append({"blobPath": n, "summary": _summarize_payload(payload)})
+            except Exception as re:
+                logging.warning(f"Failed reading blob {n}: {re}")
+        return func.HttpResponse(json.dumps({"records": records}), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"traffic/history failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="traffic/forecast", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_traffic_forecast(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        container = _get_env("TRAFFIC_CONTAINER", "traffic")
+        prefix = req.params.get("prefix", "fortmyers/")
+        window = int(req.params.get("window", "5"))
+        limit = int(req.params.get("limit", str(window)))
+        names = _list_json_blobs(container, prefix)
+        if not names:
+            return func.HttpResponse("No data", status_code=404)
+        names.sort()
+        names = names[-limit:]
+        jam_avgs = []
+        delay_avgs = []
+        for n in names:
+            try:
+                payload = _read_blob_json(container, n)
+                s = _summarize_payload(payload)
+                if isinstance(s.get("jamFactorAvg"), (int, float)):
+                    jam_avgs.append(float(s["jamFactorAvg"]))
+                if isinstance(s.get("delayRatioAvg"), (int, float)):
+                    delay_avgs.append(float(s["delayRatioAvg"]))
+            except Exception as re:
+                logging.warning(f"Failed reading blob {n}: {re}")
+        def _ma(vals: List[float], w: int) -> float:
+            if not vals:
+                return None
+            w = max(1, min(w, len(vals)))
+            return sum(vals[-w:]) / w
+        forecast = {
+            "jamFactorForecast": _ma(jam_avgs, window),
+            "delayRatioForecast": _ma(delay_avgs, window),
+            "window": window,
+            "samples": len(jam_avgs),
+        }
+        return func.HttpResponse(json.dumps(forecast), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"traffic/forecast failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="traffic/summary", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_traffic_summary(req: func.HttpRequest) -> func.HttpResponse:
+    return api_traffic_latest(req)
+
+
+# -------------------- ADT data API (ADT-backed) -------------------- #
+@app.route(route="traffic/adt/latest", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_adt_latest(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        client = get_adt_client()
+        query = "SELECT * FROM digitaltwins t WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:RoadSegment;2')"
+        twins = list(client.query_twins(query))
+        # summarize
+        count = len(twins)
+        jams = []
+        delays = []
+        for t in twins:
+            jf = t.get("jamFactor")
+            dr = t.get("delayRatio")
+            if isinstance(jf, (int, float)):
+                jams.append(float(jf))
+            if isinstance(dr, (int, float)):
+                delays.append(float(dr))
+        summary = {
+            "modelId": "dtmi:fgcu:traffic:RoadSegment;2",
+            "twinCount": count,
+            "jamFactorAvg": (sum(jams) / len(jams)) if jams else None,
+            "delayRatioAvg": (sum(delays) / len(delays)) if delays else None,
+        }
+        return func.HttpResponse(json.dumps(summary), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"adt/latest failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="traffic/adt/history", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_adt_history(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        client = get_adt_client()
+        min_jf = req.params.get("minJamFactor")
+        min_dr = req.params.get("minDelayRatio")
+        query = "SELECT * FROM digitaltwins t WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:RoadSegment;2')"
+        twins = list(client.query_twins(query))
+        items = []
+        for t in twins:
+            props = t
+            jf = props.get("jamFactor")
+            dr = props.get("delayRatio")
+            include = True
+            if min_jf is not None:
+                try:
+                    include = include and (isinstance(jf, (int, float)) and jf >= float(min_jf))
+                except Exception:
+                    pass
+            if min_dr is not None:
+                try:
+                    include = include and (isinstance(dr, (int, float)) and dr >= float(min_dr))
+                except Exception:
+                    pass
+            if include:
+                items.append({"twinId": t.get("$dtId"), "properties": props})
+        return func.HttpResponse(json.dumps({"count": len(items), "items": items}), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"adt/history failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="traffic/adt/prediction", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_adt_prediction(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        client = get_adt_client()
+        query = "SELECT * FROM digitaltwins t WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:RoadSegment;2')"
+        twins = list(client.query_twins(query))
+        pjf = []
+        pdr = []
+        jams = []
+        delays = []
+        for t in twins:
+            props = t
+            if isinstance(props.get("predictedJamFactor"), (int, float)):
+                pjf.append(float(props["predictedJamFactor"]))
+            if isinstance(props.get("predictedDelayRatio"), (int, float)):
+                pdr.append(float(props["predictedDelayRatio"]))
+            if isinstance(props.get("jamFactor"), (int, float)):
+                jams.append(float(props["jamFactor"]))
+            if isinstance(props.get("delayRatio"), (int, float)):
+                delays.append(float(props["delayRatio"]))
+        def mean(vals: List[float]):
+            return (sum(vals) / len(vals)) if vals else None
+        resp = {
+            "modelId": "dtmi:fgcu:traffic:RoadSegment;2",
+            "fromADT": {
+                "predictedJamFactorAvg": mean(pjf),
+                "predictedDelayRatioAvg": mean(pdr),
+                "sources": len(pjf) + len(pdr),
+            },
+            "fallback": {
+                "jamFactorAvg": mean(jams),
+                "delayRatioAvg": mean(delays),
+            },
+        }
+        return func.HttpResponse(json.dumps(resp), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"adt/prediction failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)

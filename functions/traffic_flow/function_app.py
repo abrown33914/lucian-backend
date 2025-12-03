@@ -13,9 +13,16 @@ from azure.core.exceptions import HttpResponseError
 import math
 
 from azure.storage.blob import BlobServiceClient  # NEW
-
+import joblib
+import numpy as np
+from collections import defaultdict
 
 app = func.FunctionApp()
+
+MODEL_CACHE = {
+    "model": None,
+    "loaded": False,
+}
 
 
 def _get_env(name: str, default: str = "") -> str:
@@ -360,6 +367,41 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
         logging.info(f"Inline ADT upsert completed: updated={updated}, errors={errors}")
     except Exception as e:
         logging.error(f"Inline ADT upsert skipped due to client error: {e}")
+
+def get_ml_model() -> object:
+    """
+    Load the delay ratio forecast model from Blob Storage once and cache it.
+    Expects:
+      - AzureWebJobsStorage connection string
+      - ML_MODELS_CONTAINER app setting (default 'ml-models')
+      - ML_MODEL_BLOB_NAME app setting (default 'delayratio_forecast_rf.joblib')
+    """
+    if MODEL_CACHE["loaded"] and MODEL_CACHE["model"] is not None:
+        return MODEL_CACHE["model"]
+
+    conn_str = os.getenv("AzureWebJobsStorage", "").strip()
+    container_name = _get_env("ML_MODELS_CONTAINER", "ml-models")
+    blob_name = _get_env("ML_MODEL_BLOB_NAME", "delayratio_forecast_rf.joblib")
+
+    if not conn_str:
+        raise RuntimeError("AzureWebJobsStorage is not configured.")
+
+    try:
+        service = BlobServiceClient.from_connection_string(conn_str)
+        container = service.get_container_client(container_name)
+        blob_client = container.get_blob_client(blob_name)
+
+        import io
+        buf = io.BytesIO(blob_client.download_blob().readall())
+        model = joblib.load(buf)
+
+        MODEL_CACHE["model"] = model
+        MODEL_CACHE["loaded"] = True
+        logging.info(f"ML model loaded from blob: container={container_name}, blob={blob_name}")
+        return model
+    except Exception as e:
+        logging.error(f"Failed to load ML model from blob: {e}")
+        raise
 
 
 # -------------------- Digital Twins helper -------------------- #
@@ -727,3 +769,359 @@ def http_export_history(req: func.HttpRequest) -> func.HttpResponse:
     }
     return func.HttpResponse(csv_text, status_code=200, headers=headers)
 
+def _run_pavement_aggregate_internal(max_blobs: int = 50) -> dict:
+    """
+    Core logic to aggregate traffic history into PavementSegment twins.
+    Returns a summary dict with counts and errors.
+    """
+    conn_str = os.getenv("AzureWebJobsStorage")
+    if not conn_str:
+        logging.error("AzureWebJobsStorage is not configured.")
+        return {
+            "segmentsAggregated": 0,
+            "twinsUpdated": 0,
+            "errors": 1,
+            "blobsUsed": 0,
+        }
+
+    container_name = _get_env("TRAFFIC_CONTAINER", "traffic")
+    prefix = "fortmyers/"
+
+    # Connect to blob container
+    try:
+        blob_service = BlobServiceClient.from_connection_string(conn_str)
+        container = blob_service.get_container_client(container_name)
+    except Exception as e:
+        logging.error(f"Failed to connect to blob container: {e}")
+        return {
+            "segmentsAggregated": 0,
+            "twinsUpdated": 0,
+            "errors": 1,
+            "blobsUsed": 0,
+        }
+
+    # Newest → oldest blobs
+    try:
+        blob_names = [b.name for b in container.list_blobs(name_starts_with=prefix)]
+        blob_names.sort(reverse=True)
+        blob_names = blob_names[:max_blobs]
+    except Exception as e:
+        logging.error(f"Failed to list blobs: {e}")
+        return {
+            "segmentsAggregated": 0,
+            "twinsUpdated": 0,
+            "errors": 1,
+            "blobsUsed": 0,
+        }
+
+    stats = defaultdict(lambda: {"jam": [], "delay": []})
+    total_items = 0
+
+    for name in blob_names:
+        try:
+            blob_bytes = container.download_blob(name).readall()
+            snap = json.loads(blob_bytes)
+        except Exception as e:
+            logging.warning(f"Failed to read blob {name}: {e}")
+            continue
+
+        items = snap.get("items", [])
+        for item in items:
+            try:
+                lat = float(item.get("lat"))
+                lon = float(item.get("lon"))
+                twin_id = f"road_{round(lat, 5)}_{round(lon, 5)}"
+
+                flow = (item.get("data") or {}).get("flowSegmentData", {}) or {}
+
+                jam = flow.get("jamFactor")
+                current_tt = flow.get("currentTravelTime")
+                freeflow_tt = flow.get("freeFlowTravelTime")
+
+                # Delay ratio as float
+                delay = None
+                try:
+                    if (
+                        current_tt is not None
+                        and freeflow_tt is not None
+                        and freeflow_tt > 0
+                    ):
+                        delay = float(current_tt) / float(freeflow_tt)
+                except Exception:
+                    delay = None
+
+                if jam is not None:
+                    stats[twin_id]["jam"].append(float(jam))
+                if delay is not None:
+                    stats[twin_id]["delay"].append(float(delay))
+
+                total_items += 1
+            except Exception as e:
+                logging.warning(f"Failed to process item in {name}: {e}")
+                continue
+
+    logging.info(
+        f"Pavement aggregate raw stats: {len(stats)} segments from {len(blob_names)} blobs, {total_items} items."
+    )
+
+    # Connect to ADT
+    try:
+        client = get_adt_client()
+    except Exception as e:
+        logging.error(f"ADT client error: {e}")
+        return {
+            "segmentsAggregated": len(stats),
+            "twinsUpdated": 0,
+            "errors": 1,
+            "blobsUsed": len(blob_names),
+        }
+
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    errors = 0
+
+    for twin_id, agg in stats.items():
+        try:
+            jams = agg["jam"]
+            delays = agg["delay"]
+
+            if not jams and not delays:
+                continue
+
+            avg_jam = sum(jams) / len(jams) if jams else 0.0
+            peak_jam = max(jams) if jams else 0.0
+            avg_delay = sum(delays) / len(delays) if delays else 0.0
+            peak_delay = max(delays) if delays else 0.0
+
+            # Simple stress index (you can tweak later)
+            stress = float(0.5 * avg_delay + 0.5 * (peak_jam / 10.0))
+
+            # Try to fetch the RoadSegment;2 twin for metadata
+            try:
+                road_twin = client.get_digital_twin(twin_id)
+            except Exception as e:
+                logging.warning(f"Could not fetch RoadSegment twin {twin_id}: {e}")
+                road_twin = {}
+
+            # Get segmentId, but fall back to twin_id if it's missing or empty
+            raw_segment_id = road_twin.get("segmentId")
+            if raw_segment_id is not None and str(raw_segment_id).strip() != "":
+                segment_id = str(raw_segment_id)
+            else:
+                segment_id = twin_id  # fallback: use road twin id
+
+            road_name = road_twin.get("roadName", "")
+            frc = road_twin.get("frc", "")
+            coords = road_twin.get("coordinatesGeoJson", "")
+
+            # Make the Pavement twin id UNIQUE per road segment
+            pavement_id = f"pavement_{twin_id}"
+
+            pavement_body = {
+                "$metadata": {"$model": "dtmi:fgcu:traffic:PavementSegment;1"},
+                "segmentId": segment_id,
+                "roadName": road_name,
+                "frc": frc,
+                "coordinatesGeoJson": coords,
+                "avgJamFactor": float(avg_jam),
+                "peakHourJamFactor": float(peak_jam),
+                "avgDelayRatio": float(avg_delay),
+                "peakDelayRatio": float(peak_delay),
+                "pavementStressIndex": float(stress),
+                "stressIndexMethod": "0.5*avgDelayRatio + 0.5*(peakJamFactor/10.0)",
+                "lastAggregatedUtc": now,
+            }
+
+            client.upsert_digital_twin(pavement_id, pavement_body)
+            updated += 1
+
+        except Exception as e:
+            logging.error(
+                f"Failed to upsert PavementSegment twin for {twin_id}: {e}"
+            )
+            errors += 1
+
+    logging.info(
+        f"Pavement aggregation complete: segments={len(stats)}, updated={updated}, errors={errors}, blobs={len(blob_names)}"
+    )
+
+    return {
+        "segmentsAggregated": len(stats),
+        "twinsUpdated": updated,
+        "errors": errors,
+        "blobsUsed": len(blob_names),
+    }
+
+
+def _run_local_forecast_internal() -> dict:
+    """
+    Core logic to:
+      - get ADT client
+      - load ML model
+      - query RoadSegment twins
+      - predict delayRatio_future
+      - upsert SegmentForecast twins
+
+    Returns: {"updated": int, "errors": int}
+    """
+    # 1) Get ADT client
+    try:
+        client = get_adt_client()
+    except Exception as e:
+        logging.error(f"ADT client error: {e}")
+        return {"updated": 0, "errors": 1}
+
+    # 2) Load ML model from Blob (with cache)
+    try:
+        model = get_ml_model()
+    except Exception as e:
+        logging.error(f"ML model load error: {e}")
+        return {"updated": 0, "errors": 1}
+
+    # 3) Query current RoadSegment;2 twins
+    query = (
+        "SELECT * FROM digitaltwins t "
+        "WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:RoadSegment;2')"
+    )
+    try:
+        road_twins = list(client.query_twins(query))
+    except Exception as e:
+        logging.error(f"ADT query error: {e}")
+        return {"updated": 0, "errors": 1}
+
+    if not road_twins:
+        logging.info("No RoadSegment twins found for forecasting.")
+        return {"updated": 0, "errors": 0}
+
+    updated = 0
+    errors = 0
+
+    for twin in road_twins:
+        try:
+            twin_id = twin["$dtId"]
+
+            delay_ratio = float(twin.get("delayRatio", 1.0))
+            current_speed = float(twin.get("currentSpeed", 0.0))
+            free_flow_speed = float(twin.get("freeFlowSpeed", 0.0))
+            lat = float(twin.get("latitude", 0.0))
+            lon = float(twin.get("longitude", 0.0))
+
+            now = datetime.now(timezone.utc)
+            hour = now.hour
+            dow = now.weekday()
+
+            features = np.array(
+                [
+                    [
+                        delay_ratio,
+                        current_speed,
+                        free_flow_speed,
+                        hour,
+                        dow,
+                        lat,
+                        lon,
+                    ]
+                ]
+            )
+
+            predicted = float(model.predict(features)[0])
+
+            forecast_id = f"forecast_{twin_id}"
+            forecast_body = {
+                "$metadata": {"$model": "dtmi:fgcu:traffic:SegmentForecast;1"},
+                "segmentId": twin_id,
+                "generatedAtUtc": now.isoformat(),
+                "horizonMinutes": 5,
+                "predictedJamFactor": 0.0,  # focusing on delayRatio
+                "predictedDelayRatio": predicted,
+                "predictedStressIndex": 0.0,
+                "modelVersion": "local-automl-rf-v1",
+            }
+
+            client.upsert_digital_twin(forecast_id, forecast_body)
+            updated += 1
+
+        except Exception as e:
+            logging.error(
+                f"Forecast failed for twin {twin.get('$dtId', 'unknown')}: {e}"
+            )
+            errors += 1
+
+    logging.info(f"Local ML forecast complete: updated={updated}, errors={errors}")
+    return {"updated": updated, "errors": errors}
+
+
+@app.route(
+    route="traffic/forecast/local-ml",
+    methods=["POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def http_apply_local_forecast(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Manual trigger (HTTP) to run the local ML forecast.
+    """
+    result = _run_local_forecast_internal()
+    return func.HttpResponse(
+        json.dumps(result),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+@app.schedule(schedule="0 */5 * * * *", arg_name="timer_forecast")
+def scheduled_local_forecast(timer_forecast: func.TimerRequest) -> None:
+    """
+    Timer-triggered forecast:
+    Runs every 5 minutes and updates SegmentForecast twins
+    based on the latest RoadSegment;2 data.
+    """
+    logging.info("Starting scheduled local ML forecast run")
+    result = _run_local_forecast_internal()
+    logging.info(
+        f"Scheduled forecast run finished: updated={result.get('updated')}, "
+        f"errors={result.get('errors')}"
+    )
+
+
+@app.route(
+    route="pavement/aggregate",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def http_pavement_aggregate(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Manual / debug trigger for pavement aggregation.
+    Example:
+      GET /api/pavement/aggregate?blobs=50
+    """
+    try:
+        max_blobs = int(req.params.get("blobs", "50"))
+    except Exception:
+        max_blobs = 50
+
+    result = _run_pavement_aggregate_internal(max_blobs=max_blobs)
+    return func.HttpResponse(
+        json.dumps(result),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+@app.schedule(
+    schedule="0 */5 * * * *",   # every 5 minutes
+    arg_name="timer_pavement",
+    run_on_startup=True,        # run once when function host starts
+    use_monitor=True,
+)
+def scheduled_pavement_aggregate(timer_pavement: func.TimerRequest) -> None:
+    """
+    Timer-triggered PavementSegment aggregation (every 5 minutes).
+    Uses the shared _run_pavement_aggregate_internal() helper.
+    """
+    logging.info(">>> [PAVEMENT TIMER] Starting scheduled pavement aggregation run...")
+    try:
+        max_blobs = int(os.getenv("PAVEMENT_BLOBS", "50"))
+    except Exception:
+        max_blobs = 50
+
+    result = _run_pavement_aggregate_internal(max_blobs=max_blobs)
+    logging.info(f">>> [PAVEMENT TIMER] Result: {result}")

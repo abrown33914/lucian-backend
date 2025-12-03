@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FGCU Traffic Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f172a; /* slate-900 */
+      --panel: #1e293b; /* slate-800 */
+      --text: #e2e8f0; /* slate-200 */
+      --muted: #94a3b8; /* slate-400 */
+      --accent: #38bdf8; /* sky-400 */
+      --ok: #22c55e; /* green-500 */
+      --warn: #f59e0b; /* amber-500 */
+      --err: #ef4444; /* red-500 */
+    }
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", Arial, sans-serif; }
+    a { color: var(--accent); }
+    .wrap { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: var(--panel); border-radius: 12px; padding: 16px; box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 24px rgba(0,0,0,0.35); }
+    .card h2 { margin: 0 0 8px; font-size: 18px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .row > * { margin: 6px 0; }
+    .kpi { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .kpi div { background: rgba(255,255,255,0.05); border-radius: 8px; padding: 8px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .btn { background: var(--accent); color: #002; border: 0; padding: 8px 12px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+    .btn.secondary { background: rgba(255,255,255,0.1); color: var(--text); }
+    .list { max-height: 260px; overflow: auto; border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); }
+    .list table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .list th, .list td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .list tr:hover { background: rgba(255,255,255,0.06); }
+    .status { font-weight: 700; }
+    #map { height: 420px; width: 100%; border-radius: 12px; overflow: hidden; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>FGCU Traffic Dashboard</h1>
+    <p class="muted">Using Azure Functions APIs: latest, history, forecast, ADT summary & prediction.</p>
+
+    <div class="card">
+      <div class="row">
+        <strong>API Base:</strong>
+        <span class="muted">https://st-functions-dxeyhugzd4fsffdn.eastus2-01.azurewebsites.net/api</span>
+        <span class="muted" id="netStatus"></span>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top: 16px;">
+      <div class="card">
+        <h2>Latest Snapshot</h2>
+        <div class="row">
+          <button class="btn" id="btnLatest">Refresh</button>
+          <span class="muted" id="latestMeta"></span>
+          <button class="btn secondary" id="btnDrawSegments" title="Draw map from latest">Draw Map</button>
+        </div>
+        <div class="kpi" id="latestKpi"></div>
+      </div>
+
+      <div class="card">
+        <h2>Forecast</h2>
+        <div class="row">
+          <label>window</label><input id="forecastWindow" value="5" size="4" />
+          <label>limit</label><input id="forecastLimit" value="5" size="4" />
+          <button class="btn" id="btnForecast">Run Forecast</button>
+        </div>
+        <div class="kpi" id="forecastKpi"></div>
+      </div>
+
+      <div class="card">
+        <h2>ADT Summary</h2>
+        <div class="row">
+          <button class="btn" id="btnAdtLatest">Refresh</button>
+          <button class="btn secondary" id="btnAdtPrediction">Predictions</button>
+        </div>
+        <div class="kpi" id="adtKpi"></div>
+        <div class="kpi" id="adtPredKpi" style="margin-top:8px;"></div>
+        <div id="map"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 16px;">
+      <div class="row">
+        <h2 style="margin:0;">Recent History</h2>
+        <label style="margin-left:12px;">limit</label><input id="historyLimit" value="10" size="4" />
+        <button class="btn" id="btnHistory">Load</button>
+      </div>
+      <div class="list" id="historyList"></div>
+    </div>
+  </div>
+
+  <!-- Leaflet assets without SRI to avoid blocked loads -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const els = {
+      btnLatest: document.getElementById('btnLatest'),
+      btnForecast: document.getElementById('btnForecast'),
+      btnAdtLatest: document.getElementById('btnAdtLatest'),
+      btnAdtPrediction: document.getElementById('btnAdtPrediction'),
+      btnHistory: document.getElementById('btnHistory'),
+      latestMeta: document.getElementById('latestMeta'),
+      latestKpi: document.getElementById('latestKpi'),
+      forecastKpi: document.getElementById('forecastKpi'),
+      adtKpi: document.getElementById('adtKpi'),
+      adtPredKpi: document.getElementById('adtPredKpi'),
+      historyLimit: document.getElementById('historyLimit'),
+      historyList: document.getElementById('historyList'),
+      forecastWindow: document.getElementById('forecastWindow'),
+      forecastLimit: document.getElementById('forecastLimit'),
+      netStatus: document.getElementById('netStatus'),
+    };
+
+    const BASE = 'https://st-functions-dxeyhugzd4fsffdn.eastus2-01.azurewebsites.net/api';
+
+    function fmt(v) {
+      if (v === null || v === undefined) return '-';
+      if (typeof v === 'number') return Number(v).toFixed(3);
+      return String(v);
+    }
+
+    async function getJson(path) {
+      const url = `${BASE}${path}`;
+      try {
+        const r = await fetch(url, { mode: 'cors' });
+        if (!r.ok) {
+          els.netStatus.textContent = `HTTP ${r.status} ${r.statusText}`;
+          throw new Error(`${r.status} ${r.statusText}`);
+        }
+        els.netStatus.textContent = 'OK';
+        return r.json();
+      } catch (e) {
+        // Likely CORS or network; surface a helpful message
+        els.netStatus.textContent = `Failed to fetch (${e.message}). If CORS blocks, allow this page origin in Function App.`;
+        throw e;
+      }
+    }
+
+    async function loadLatest() {
+      try {
+        const data = await getJson('/traffic/latest');
+        els.latestMeta.textContent = `blob: ${data.blobPath || '-'} | ts: ${data.timestamp || '-'}`;
+        els.latestKpi.innerHTML = `
+          <div><div class="muted">count</div><div class="status">${fmt(data.count)}</div></div>
+          <div><div class="muted">jamFactorAvg</div><div class="status">${fmt(data.jamFactorAvg)}</div></div>
+          <div><div class="muted">delayRatioAvg</div><div class="status">${fmt(data.delayRatioAvg)}</div></div>
+        `;
+      } catch (e) {
+        els.latestMeta.textContent = `error: ${e.message}`;
+        els.latestKpi.innerHTML = '';
+      }
+    }
+
+    async function loadForecast() {
+      try {
+        const w = parseInt(els.forecastWindow.value || '5', 10);
+        const l = parseInt(els.forecastLimit.value || String(w), 10);
+        const data = await getJson(`/traffic/forecast?window=${w}&limit=${l}`);
+        els.forecastKpi.innerHTML = `
+          <div><div class="muted">jamFactorForecast</div><div class="status">${fmt(data.jamFactorForecast)}</div></div>
+          <div><div class="muted">delayRatioForecast</div><div class="status">${fmt(data.delayRatioForecast)}</div></div>
+          <div><div class="muted">samples</div><div class="status">${fmt(data.samples)}</div></div>
+        `;
+      } catch (e) {
+        els.forecastKpi.innerHTML = `<div class="muted">error: ${e.message}</div>`;
+      }
+    }
+
+    async function loadAdtLatest() {
+      try {
+        const data = await getJson('/traffic/adt/latest');
+        els.adtKpi.innerHTML = `
+          <div><div class="muted">twinCount</div><div class="status">${fmt(data.twinCount)}</div></div>
+          <div><div class="muted">jamFactorAvg</div><div class="status">${fmt(data.jamFactorAvg)}</div></div>
+          <div><div class="muted">delayRatioAvg</div><div class="status">${fmt(data.delayRatioAvg)}</div></div>
+        `;
+      } catch (e) {
+        els.adtKpi.innerHTML = `<div class="muted">error: ${e.message}</div>`;
+      }
+    }
+
+    async function loadAdtPrediction() {
+      try {
+        const data = await getJson('/traffic/adt/prediction');
+        const f = data.fallback || {}; const a = data.fromADT || {};
+        els.adtPredKpi.innerHTML = `
+          <div><div class="muted">fromADT.predictedJamFactorAvg</div><div class="status">${fmt(a.predictedJamFactorAvg)}</div></div>
+          <div><div class="muted">fromADT.predictedDelayRatioAvg</div><div class="status">${fmt(a.predictedDelayRatioAvg)}</div></div>
+          <div><div class="muted">fallback.jamFactorAvg</div><div class="status">${fmt(f.jamFactorAvg)}</div></div>
+          <div><div class="muted">fallback.delayRatioAvg</div><div class="status">${fmt(f.delayRatioAvg)}</div></div>
+        `;
+      } catch (e) {
+        els.adtPredKpi.innerHTML = `<div class="muted">error: ${e.message}</div>`;
+      }
+    }
+
+    // Map setup and points loader
+    let map;
+    let markersLayer;
+    let segmentsLayer;
+    function initMap() {
+      if (map) return;
+      if (!window.L) {
+        els.netStatus.textContent = 'Leaflet failed to load';
+        return;
+      }
+      map = L.map('map').setView([26.4666, -81.7726], 12);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+      markersLayer = L.layerGroup().addTo(map);
+      segmentsLayer = L.layerGroup().addTo(map);
+    }
+
+    function colorForJam(j) {
+      if (j == null) return '#9ca3af'; // gray
+      if (j < 3) return '#22c55e';     // green
+      if (j < 7) return '#f59e0b';     // amber
+      return '#ef4444';                // red
+    }
+
+    async function loadAdtPoints() {
+      initMap();
+      try {
+        const data = await getJson('/traffic/adt/points');
+        markersLayer.clearLayers();
+        segmentsLayer.clearLayers();
+        const items = data.items || [];
+        items.forEach(p => {
+          const radius = 6;
+          const color = colorForJam(p.jamFactor);
+          const marker = L.circleMarker([p.lat, p.lon], {
+            radius,
+            color,
+            fillColor: color,
+            fillOpacity: 0.8,
+          }).bindPopup(
+            `<strong>${p.roadName || 'segment'}</strong><br/>`
+            + `jamFactor: ${fmt(p.jamFactor)}<br/>`
+            + `delayRatio: ${fmt(p.delayRatio)}`
+          );
+          markersLayer.addLayer(marker);
+        });
+        if (items.length) {
+          const latlngs = items.map(p => [p.lat, p.lon]);
+          const bounds = L.latLngBounds(latlngs);
+          map.fitBounds(bounds.pad(0.2));
+        }
+      } catch (e) {
+        // leave map empty but show status
+        els.netStatus.textContent = `Map load error: ${e.message}`;
+      }
+    }
+
+    // Draw polylines like Untitled-1.html, using /traffic/latest blob payload
+    async function drawSegmentsFromLatest() {
+      initMap();
+      try {
+        const latest = await getJson('/traffic/latest');
+        const items = latest.items || [];
+        if (!items.length) {
+          els.netStatus.textContent = 'No items in latest to draw';
+          return;
+        }
+        segmentsLayer.clearLayers();
+        // Helper to color by speed ratio like Untitled-1
+        function speedColor(current, freeFlow) {
+          const ratio = (freeFlow && freeFlow > 0) ? (current / freeFlow) : 0;
+          if (ratio > 0.8) return '#22c55e';
+          else if (ratio > 0.5) return '#f59e0b';
+          return '#ef4444';
+        }
+        const allCoords = [];
+        items.forEach(item => {
+          const flow = item?.data?.flowSegmentData;
+          const coordsArr = flow?.coordinates?.coordinate || [];
+          const coords = coordsArr.map(c => [c.latitude, c.longitude]);
+          if (!coords.length) return;
+          const color = speedColor(flow?.currentSpeed, flow?.freeFlowSpeed);
+          const popupContent = `
+            <strong>FRC:</strong> ${fmt(flow?.frc)}<br>
+            <strong>Current Speed:</strong> ${fmt(flow?.currentSpeed)} mph<br>
+            <strong>Free Flow Speed:</strong> ${fmt(flow?.freeFlowSpeed)} mph<br>
+            <strong>Current Travel Time:</strong> ${fmt(flow?.currentTravelTime)} s<br>
+            <strong>Free Flow Travel Time:</strong> ${fmt(flow?.freeFlowTravelTime)} s<br>
+            <strong>Confidence:</strong> ${fmt(flow?.confidence)}<br>
+            <strong>Road Closure:</strong> ${fmt(flow?.roadClosure)}<br>
+            <strong>Original Lat/Lon:</strong> ${fmt(item?.lat)}, ${fmt(item?.lon)}<br>
+            <a href="${item?.url || '#'}" target="_blank">Segment URL</a>
+          `;
+          L.polyline(coords, { color, weight: 4, opacity: 0.7 })
+            .bindPopup(popupContent)
+            .addTo(segmentsLayer);
+          allCoords.push(...coords);
+        });
+        if (allCoords.length) {
+          map.fitBounds(allCoords);
+        }
+      } catch (e) {
+        els.netStatus.textContent = `Draw segments error: ${e.message}`;
+      }
+    }
+
+    async function loadHistory() {
+      try {
+        const limit = parseInt(els.historyLimit.value || '10', 10);
+        const data = await getJson(`/traffic/history?limit=${limit}`);
+        const rows = (data.records || []).map(r => {
+          const s = r.summary || {};
+          return `<tr>
+            <td>${r.blobPath || '-'}</td>
+            <td>${fmt(s.timestamp)}</td>
+            <td>${fmt(s.count)}</td>
+            <td>${fmt(s.jamFactorAvg)}</td>
+            <td>${fmt(s.delayRatioAvg)}</td>
+          </tr>`;
+        }).join('');
+        els.historyList.innerHTML = `<table>
+          <thead><tr><th>blob</th><th>timestamp</th><th>count</th><th>jamAvg</th><th>delayAvg</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+      } catch (e) {
+        els.historyList.innerHTML = `<div class="muted">error: ${e.message}</div>`;
+      }
+    }
+
+    els.btnLatest.onclick = loadLatest;
+    els.btnForecast.onclick = loadForecast;
+    els.btnAdtLatest.onclick = loadAdtLatest;
+    els.btnAdtPrediction.onclick = loadAdtPrediction;
+    els.btnHistory.onclick = loadHistory;
+    // Map load on ADT refresh
+    els.btnAdtLatest.onclick = () => { loadAdtLatest(); loadAdtPoints(); };
+    // Draw segments from latest snapshot
+    const btnDrawSegments = document.getElementById('btnDrawSegments');
+    btnDrawSegments.onclick = drawSegmentsFromLatest;
+
+    // Auto-load on start
+    loadLatest();
+    loadForecast();
+    loadAdtLatest(); loadAdtPoints();
+    loadAdtPrediction();
+    loadHistory();
+  </script>
+</body>
+</html>

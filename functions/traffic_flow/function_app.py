@@ -1536,3 +1536,66 @@ def api_adt_prediction(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"adt/prediction failed: {e}")
         return func.HttpResponse(f"Error: {e}", status_code=500)
+
+
+@app.route(route="traffic/adt/points", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def api_adt_points(req: func.HttpRequest) -> func.HttpResponse:
+    """Return geospatial points for RoadSegment twins with basic metrics for mapping.
+
+    Optional query params:
+    - bbox: comma-separated lat,lon pairs defining SW and NE corners: "lat1,lon1,lat2,lon2"
+    - limit: max number of items to return (after sorting by jamFactor desc)
+    """
+    try:
+        client = get_adt_client()
+        query = "SELECT * FROM digitaltwins t WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:RoadSegment;2')"
+        twins = list(client.query_twins(query))
+        items = []
+        # Parse optional bbox filter
+        bbox_param = req.params.get("bbox")
+        bbox = None
+        if bbox_param:
+            try:
+                parts = [float(p.strip()) for p in bbox_param.split(",")]
+                if len(parts) == 4:
+                    lat1, lon1, lat2, lon2 = parts
+                    sw_lat, ne_lat = min(lat1, lat2), max(lat1, lat2)
+                    sw_lon, ne_lon = min(lon1, lon2), max(lon1, lon2)
+                    bbox = (sw_lat, sw_lon, ne_lat, ne_lon)
+            except Exception:
+                bbox = None
+        for t in twins:
+            try:
+                lat = float(t.get("latitude"))
+                lon = float(t.get("longitude"))
+                jf = t.get("jamFactor")
+                dr = t.get("delayRatio")
+                rn = t.get("roadName")
+                # Apply bbox filter if provided
+                if bbox:
+                    sw_lat, sw_lon, ne_lat, ne_lon = bbox
+                    if not (sw_lat <= lat <= ne_lat and sw_lon <= lon <= ne_lon):
+                        continue
+                items.append({
+                    "lat": lat,
+                    "lon": lon,
+                    "jamFactor": float(jf) if isinstance(jf, (int, float)) else None,
+                    "delayRatio": float(dr) if isinstance(dr, (int, float)) else None,
+                    "roadName": rn or "",
+                })
+            except Exception:
+                continue
+        # Sort by jamFactor desc and apply limit
+        items.sort(key=lambda x: (x["jamFactor"] if x["jamFactor"] is not None else -1), reverse=True)
+        limit_param = req.params.get("limit")
+        if limit_param:
+            try:
+                lim = int(limit_param)
+                if lim > 0:
+                    items = items[:lim]
+            except Exception:
+                pass
+        return func.HttpResponse(json.dumps({"count": len(items), "items": items}), mimetype="application/json", status_code=200)
+    except Exception as e:
+        logging.error(f"adt/points failed: {e}")
+        return func.HttpResponse(f"Error: {e}", status_code=500)

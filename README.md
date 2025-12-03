@@ -246,17 +246,27 @@ PAVEMENT_MODEL_BLOB=pavement_model.joblib
 
 ---
 
-## 🔥 **API Endpoints (Complete)**
 
-### **Traffic APIs**
-needs filled
+
+## 🔥 **API Endpoints (Implemented)**
+
+### **Traffic / ADT Management APIs**
+
+- `GET /api/traffic/adt/diagnose`
+        - Purpose: Validate ADT connectivity, verify the `RoadSegment` model exists, and perform a small
+                upsert/delete test to confirm permissions and connectivity. Returns a JSON diagnostic report.
+
+- `POST /api/traffic/adt/upsert-diagnosed`
+        - Purpose: Accepts a collector-style payload (the same shape produced by the timer collector)
+                and upserts `RoadSegment` twins into ADT. Useful for manual testing or replaying snapshot blobs.
+
+Notes: The front-end dashboard includes calls to additional endpoints (e.g. `/traffic/latest`,
+`/traffic/forecast`, `/traffic/history`, `/traffic/adt/points`, `/traffic/adt/prediction`) but these
+routes are not implemented as HTTP functions in the current `function_app.py`. Collection is handled
+by a timer trigger and processing by a blob trigger; we can add HTTP endpoints to expose those
+behaviors on demand if desired.
 
 ---
-
-### **Pavement APIs**
-needs filled
-
-
 ---
 
 ## 🖥️ **Digital Twins Explorer Queries**
@@ -326,6 +336,4 @@ lucian-backend/
 
 ## ✔️ **Next Steps**
 
-* Ensure API's are accesible for frontend team
-* Add relationship modeling
 * Include cost analysis section

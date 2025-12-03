@@ -404,6 +404,41 @@ def get_ml_model() -> object:
         raise
 
 
+_pavement_model_cache = None
+
+
+def get_pavement_model():
+    """
+    Load the pavement model from Blob Storage (cached in memory).
+    Uses:
+      - AzureWebJobsStorage
+      - PAVEMENT_MODEL_CONTAINER
+      - PAVEMENT_MODEL_BLOB
+    """
+    global _pavement_model_cache
+    if _pavement_model_cache is not None:
+        return _pavement_model_cache
+
+    conn_str = os.getenv("AzureWebJobsStorage")
+    if not conn_str:
+        raise RuntimeError("AzureWebJobsStorage is not configured.")
+
+    container_name = os.getenv("PAVEMENT_MODEL_CONTAINER", "models")
+    blob_name = os.getenv("PAVEMENT_MODEL_BLOB", "pavement_model.joblib")
+
+    logging.info(
+        f"Loading pavement model from container='{container_name}', blob='{blob_name}'"
+    )
+
+    service = BlobServiceClient.from_connection_string(conn_str)
+    container = service.get_container_client(container_name)
+    blob_data = container.download_blob(blob_name).readall()
+
+    import io
+    _pavement_model_cache = joblib.load(io.BytesIO(blob_data))
+    return _pavement_model_cache
+
+
 # -------------------- Digital Twins helper -------------------- #
 def get_adt_client() -> DigitalTwinsClient:
     """Create a DigitalTwinsClient using the Function App's managed identity."""
@@ -769,6 +804,111 @@ def http_export_history(req: func.HttpRequest) -> func.HttpResponse:
     }
     return func.HttpResponse(csv_text, status_code=200, headers=headers)
 
+def _run_pavement_forecast_internal() -> dict:
+    """
+    Core logic to:
+      - get ADT client
+      - load pavement ML model
+      - query RoadSegment;2 twins
+      - predict future pavement stress index
+      - upsert PavementForecast twins
+
+    Returns: {"updated": int, "errors": int}
+    """
+    # 1) ADT client
+    try:
+        client = get_adt_client()
+    except Exception as e:
+        logging.error(f"Pavement forecast: ADT client error: {e}")
+        return {"updated": 0, "errors": 1}
+
+    # 2) Load pavement model
+    try:
+        model = get_pavement_model()
+    except Exception as e:
+        logging.error(f"Pavement forecast: ML model load error: {e}")
+        return {"updated": 0, "errors": 1}
+
+    # 3) Query current RoadSegment;2 twins
+    query = "SELECT * FROM digitaltwins t WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:RoadSegment;2')"
+    try:
+        road_twins = list(client.query_twins(query))
+    except Exception as e:
+        logging.error(f"Pavement forecast: ADT query error: {e}")
+        return {"updated": 0, "errors": 1}
+
+    if not road_twins:
+        logging.info("Pavement forecast: no RoadSegment twins found.")
+        return {"updated": 0, "errors": 0}
+
+    updated = 0
+    errors = 0
+
+    for twin in road_twins:
+        try:
+            props = twin
+            twin_id = props["$dtId"]
+
+            # Features must match training columns:
+            delay_ratio = float(props.get("delayRatio", 1.0))
+            jam_factor = float(props.get("jamFactor", 0.0))
+            current_speed = float(props.get("currentSpeed", 0.0))
+            free_flow_speed = float(props.get("freeFlowSpeed", 0.0))
+            lat = float(props.get("latitude", 0.0))
+            lon = float(props.get("longitude", 0.0))
+
+            now = datetime.now(timezone.utc)
+            hour = now.hour
+            dow = now.weekday()
+
+            features = np.array(
+                [[
+                    delay_ratio,
+                    jam_factor,
+                    current_speed,
+                    free_flow_speed,
+                    hour,
+                    dow,
+                    lat,
+                    lon,
+                ]]
+            )
+
+            predicted_stress = float(model.predict(features)[0])
+
+            # Map stress index (≈ 0..1+ ) to a 0–100 "health" score
+            # Higher stress -> lower condition score
+            condition_score = 100.0 * max(0.0, 1.0 - predicted_stress)
+            if condition_score < 0.0:
+                condition_score = 0.0
+            if condition_score > 100.0:
+                condition_score = 100.0
+
+            forecast_id = f"pavementForecast_{twin_id}"
+            forecast_body = {
+                "$metadata": {"$model": "dtmi:fgcu:traffic:PavementForecast;1"},
+                "segmentId": twin_id,
+                "generatedAtUtc": now.isoformat(),
+                "horizonMinutes": 5,
+                "predictedPavementStressIndex": predicted_stress,
+                "predictedConditionScore": condition_score,
+                "predictionMethod": "rf-regression-pavementStress-next",
+                "modelVersion": "local-pavement-rf-v1",
+            }
+
+            client.upsert_digital_twin(forecast_id, forecast_body)
+            updated += 1
+
+        except Exception as e:
+            logging.error(
+                f"Pavement forecast failed for twin {twin.get('$dtId', 'unknown')}: {e}"
+            )
+            errors += 1
+
+    logging.info(f"Pavement forecast complete: updated={updated}, errors={errors}")
+    return {"updated": updated, "errors": errors}
+
+
 def _run_pavement_aggregate_internal(max_blobs: int = 50) -> dict:
     """
     Core logic to aggregate traffic history into PavementSegment twins.
@@ -1125,3 +1265,40 @@ def scheduled_pavement_aggregate(timer_pavement: func.TimerRequest) -> None:
 
     result = _run_pavement_aggregate_internal(max_blobs=max_blobs)
     logging.info(f">>> [PAVEMENT TIMER] Result: {result}")
+
+@app.route(
+    route="pavement/forecast/local-ml",
+    methods=["POST"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def http_pavement_forecast(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Manual trigger (HTTP) for pavement forecast.
+    Call this from Portal / Postman to force a run.
+    """
+    result = _run_pavement_forecast_internal()
+    return func.HttpResponse(
+        json.dumps(result),
+        mimetype="application/json",
+        status_code=200,
+    )
+
+
+@app.schedule(
+    schedule="0 */5 * * * *",        # every 5 minutes
+    arg_name="timer_pavement_forecast",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def scheduled_pavement_forecast(timer_pavement_forecast: func.TimerRequest) -> None:
+    """
+    Timer-triggered pavement forecast.
+    Runs every 15 minutes and updates PavementForecast twins
+    based on the latest RoadSegment;2 data.
+    """
+    logging.info(">>> [PAVEMENT FORECAST TIMER] Starting scheduled pavement forecast...")
+    result = _run_pavement_forecast_internal()
+    logging.info(
+        f">>> [PAVEMENT FORECAST TIMER] Result: updated={result.get('updated')}, "
+        f"errors={result.get('errors')}"
+    )

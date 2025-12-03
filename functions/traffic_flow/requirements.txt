@@ -1,2 +1,5 @@
 azure-functions
 requests
+azure-identity
+azure-digitaltwins-core
+azure-core

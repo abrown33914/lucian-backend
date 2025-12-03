@@ -7,6 +7,9 @@ from typing import List, Tuple
 
 import requests
 import azure.functions as func
+from azure.identity import ManagedIdentityCredential
+from azure.digitaltwins.core import DigitalTwinsClient
+from azure.core.exceptions import HttpResponseError
 import math
 
 
@@ -28,6 +31,31 @@ def build_query_url(lat: float, lon: float, subscription_key: str, zoom: int) ->
         f"&zoom={zoom}"
         f"&query={lat},{lon}"
         f"&subscription-key={subscription_key}"
+    )
+
+
+def build_incidents_url(lat: float, lon: float, radius_km: float, subscription_key: str, severity: str = "") -> str:
+    """Build Azure Maps Traffic Incident URL around a point within a radius."""
+    base = "https://atlas.microsoft.com/traffic/incident/json"
+    # bbox can be used; for simplicity use `query` with radius and optional severity
+    params = [
+        "api-version=1.0",
+        f"query={lat},{lon}",
+        f"radius={int(radius_km * 1000)}",
+        f"subscription-key={subscription_key}",
+    ]
+    if severity:
+        params.append(f"severity={severity}")
+    return base + "?" + "&".join(params)
+
+
+def build_route_url(origin: Tuple[float, float], destination: Tuple[float, float], subscription_key: str, traffic: bool = True) -> str:
+    """Build Azure Maps Route Directions URL between two points."""
+    base = "https://atlas.microsoft.com/route/directions/json"
+    traffic_flag = "true" if traffic else "false"
+    return (
+        f"{base}?api-version=1.0&query={origin[0]},{origin[1]}:{destination[0]},{destination[1]}"
+        f"&traffic={traffic_flag}&subscription-key={subscription_key}"
     )
 
 
@@ -228,6 +256,53 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
     center_lat = float(_get_env("FORT_MYERS_LAT", "26.4635"))
     center_lon = float(_get_env("FORT_MYERS_LON", "-81.7728"))
 
+    # Fetch traffic incidents around center within radius (configurable)
+    incidents_radius_km = float(_get_env("FGCU_INCIDENTS_RADIUS_KM", "3"))
+    incidents_severity = _get_env("FGCU_INCIDENTS_SEVERITY", "")  # e.g., 'minor','moderate','major'
+    incidents_data = []
+    try:
+        inc_url = build_incidents_url(center_lat, center_lon, incidents_radius_km, subscription_key, incidents_severity)
+        inc_json = fetch_with_retries(inc_url)
+        incidents_data = inc_json.get("results") or inc_json.get("incidents") or []
+    except Exception as e:
+        logging.warning(f"Traffic incidents fetch failed: {e}")
+
+    # Sample a few OD pairs for route delay ratios
+    route_pairs = [
+        ((26.4666, -81.7726), (26.4886, -81.7803)),  # FGCU -> Alico
+        ((26.4666, -81.7726), (26.4419, -81.7706)),  # FGCU -> Corkscrew
+        ((26.4638, -81.7725), (26.4682, -81.7677)),  # Campus -> I-75
+    ]
+    route_metrics = []
+    for o, d in route_pairs:
+        try:
+            rt_url_live = build_route_url(o, d, subscription_key, traffic=True)
+            rt_url_free = build_route_url(o, d, subscription_key, traffic=False)
+            live = fetch_with_retries(rt_url_live)
+            free = fetch_with_retries(rt_url_free)
+            # Extract travel time in seconds; Azure Maps uses summary for routes
+            def _duration_s(rjson):
+                try:
+                    return (
+                        rjson["routes"][0]["summary"]["travelTimeInSeconds"]
+                    )
+                except Exception:
+                    return None
+            t_live = _duration_s(live)
+            t_free = _duration_s(free)
+            ratio = (t_live / t_free) if (t_live and t_free and t_free > 0) else None
+            route_metrics.append({
+                "origin": o,
+                "destination": d,
+                "liveSeconds": t_live,
+                "freeflowSeconds": t_free,
+                "delayRatio": ratio,
+                "liveUrl": rt_url_live,
+                "freeUrl": rt_url_free,
+            })
+        except Exception as e:
+            logging.warning(f"Route sampling failed for {o}->{d}: {e}")
+
     payload = {
         "timestamp": now.isoformat(),
         "center": {"lat": center_lat, "lon": center_lon},
@@ -242,6 +317,10 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
         "ringStepKm": ring_step_km,
         "failures": failures,
         "items": results,
+        "incidentsRadiusKm": incidents_radius_km,
+        "incidentsSeverity": incidents_severity,
+        "incidents": incidents_data,
+        "routes": route_metrics,
     }
 
     outblob.set(json.dumps(payload))
@@ -249,21 +328,262 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
         f"Wrote blob with {len(results)} unique snapped items (failures={failures})"
     )
 
+    # Inline ADT upsert as a fallback to ensure twins are created even if blob trigger is misconfigured
+    try:
+        client = get_adt_client()
+        timestamp_str = payload.get("timestamp")
+        updated = 0
+        errors = 0
+        for item in results:
+            try:
+                lat = float(item.get("lat"))
+                lon = float(item.get("lon"))
+                flow = (item.get("data") or {}).get("flowSegmentData", {})
+                _adt_upsert_road_segment(client, lat, lon, flow, timestamp_str)
+                updated += 1
+            except Exception as e:
+                errors += 1
+                logging.error(f"Inline ADT upsert failed for item {item}: {e}")
+        logging.info(f"Inline ADT upsert completed: updated={updated}, errors={errors}")
+    except Exception as e:
+        logging.error(f"Inline ADT upsert skipped due to client error: {e}")
 
-# Optional HTTP trigger to check configuration / liveness
-@app.route(route="traffic/fortmyers", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
-def http_collect(req: func.HttpRequest) -> func.HttpResponse:
-    key_present = bool(_get_env("AZURE_MAPS_SUBSCRIPTION_KEY"))
-    return func.HttpResponse(
-        json.dumps(
-            {
-                "status": "ready",
-                "mapsKeyConfigured": key_present,
-                "trafficTimerCron": "0 */5 * * * *",
-            }
-        ),
-        mimetype="application/json",
-        status_code=200,
+
+
+# -------------------- Digital Twins helper -------------------- #
+def get_adt_client() -> DigitalTwinsClient:
+    """Create a DigitalTwinsClient using the Function App's managed identity."""
+    adt_url = os.getenv("ADT_SERVICE_URL", "").strip()
+    if not adt_url:
+        raise RuntimeError("ADT_SERVICE_URL is not configured.")
+    cred = ManagedIdentityCredential()
+    return DigitalTwinsClient(adt_url, cred)
+
+
+def _adt_upsert_road_segment(client: DigitalTwinsClient, lat: float, lon: float, flow: dict, timestamp: str) -> None:
+    """Map Azure Maps flow segment to RoadSegment twin and upsert in ADT."""
+    current_speed = flow.get("currentSpeed")
+    free_flow_speed = flow.get("freeFlowSpeed")
+    confidence = flow.get("confidence")
+    jam_factor = flow.get("jamFactor")
+    current_tt = flow.get("currentTravelTime")
+    freeflow_tt = flow.get("freeFlowTravelTime")
+    frc = flow.get("frc")
+    closure = flow.get("roadClosure")
+    coords = (flow.get("coordinates") or {}).get("coordinate") or []
+    polyline = [[c.get("longitude"), c.get("latitude")] for c in coords if isinstance(c, dict)]
+    geojson_line = None
+    try:
+        if polyline:
+            # Downsample coordinates to keep GeoJSON under ADT 4096-byte string limit
+            coords_ds = polyline[:]
+            # Keep endpoints always; iteratively reduce by taking every 2nd point
+            def build(coords_list):
+                return json.dumps({"type": "LineString", "coordinates": coords_list})
+            gj = build(coords_ds)
+            while len(gj.encode("utf-8")) > 4000 and len(coords_ds) > 10:
+                coords_ds = [coords_ds[0]] + coords_ds[1:-1:2] + [coords_ds[-1]]
+                gj = build(coords_ds)
+            geojson_line = gj if len(gj.encode("utf-8")) <= 4096 else None
+    except Exception:
+        geojson_line = None
+    delay_ratio = None
+    try:
+        if current_tt and freeflow_tt and freeflow_tt > 0:
+            delay_ratio = float(current_tt) / float(freeflow_tt)
+    except Exception:
+        delay_ratio = None
+
+    twin_id = f"road_{round(float(lat), 5)}_{round(float(lon), 5)}"
+    twin_body = {
+        "$metadata": {"$model": "dtmi:fgcu:traffic:RoadSegment;1"},
+        "name": twin_id,
+        "latitude": float(lat),
+        "longitude": float(lon),
+        "currentSpeed": float(current_speed) if current_speed is not None else 0.0,
+        "freeFlowSpeed": float(free_flow_speed) if free_flow_speed is not None else 0.0,
+        "jamFactor": float(jam_factor) if jam_factor is not None else 0.0,
+        "confidence": float(confidence) if confidence is not None else 0.0,
+        "currentTravelTime": int(current_tt) if current_tt is not None else 0,
+        "freeFlowTravelTime": int(freeflow_tt) if freeflow_tt is not None else 0,
+        "delayRatio": float(delay_ratio) if delay_ratio is not None else 0.0,
+        "frc": str(frc) if frc is not None else "",
+        "roadClosure": bool(closure) if closure is not None else False,
+        "coordinatesGeoJson": geojson_line if geojson_line is not None else "",
+        "lastUpdatedUtc": timestamp,
+    }
+    client.upsert_digital_twin(twin_id, twin_body)
+
+
+# -------------------- Blob-trigger → ADT function -------------------- #
+@app.blob_trigger(
+    arg_name="inblob",
+    path="%TRAFFIC_CONTAINER%/fortmyers/{name}",
+    connection="AzureWebJobsStorage",
+)
+def process_fort_myers_blob(inblob: func.InputStream):
+    """
+    Triggered whenever a new Fort Myers traffic blob is created.
+    Reads the latest snapshot and upserts RoadSegment twins in Azure Digital Twins.
+    """
+    logging.info(
+        f"process_fort_myers_blob triggered, name={inblob.name}, size={inblob.length} bytes"
+    )
+    # 1) Parse JSON from blob
+    try:
+        raw = inblob.read()
+        payload = json.loads(raw)
+    except Exception as e:
+        logging.error(f"Failed to parse traffic blob as JSON: {e}")
+        return
+    items = payload.get("items", [])
+    timestamp = payload.get("timestamp")
+    if not items:
+        logging.warning("Traffic blob has no items; nothing to update.")
+        return
+    # 2) Build ADT client
+    try:
+        client = get_adt_client()
+    except Exception as e:
+        logging.error(f"Could not create ADT client: {e}")
+        return
+    updated = 0
+    errors = 0
+    # 3) Loop through each traffic item and upsert a twin
+    for item in items:
+        try:
+            lat = float(item.get("lat"))
+            lon = float(item.get("lon"))
+            flow = item.get("data", {}).get("flowSegmentData", {})
+            _adt_upsert_road_segment(client, lat, lon, flow, timestamp)
+            updated += 1
+        except Exception as e:
+            errors += 1
+            if isinstance(e, HttpResponseError):
+                logging.error(
+                    f"ADT upsert failed (status={getattr(e, 'status_code', 'unknown')}): {e.message}"
+                )
+            else:
+                logging.error(f"Failed to upsert twin for item {item}: {e}")
+    logging.info(
+        f"process_fort_myers_blob finished: updated={updated}, errors={errors}"
     )
 
- 
+
+
+
+
+
+# -------------------- Diagnosed upsert (validates then upserts) -------------------- #
+@app.route(route="traffic/adt/upsert-diagnosed", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def http_upsert_diagnosed(req: func.HttpRequest) -> func.HttpResponse:
+    """Validate ADT connectivity/model like diagnose, then upsert items from collector payload."""
+    try:
+        payload = req.get_json()
+    except Exception:
+        return func.HttpResponse("Invalid JSON body", status_code=400)
+
+    items = payload.get("items", [])
+    timestamp = payload.get("timestamp") or datetime.now(timezone.utc).isoformat()
+    if not isinstance(items, list) or not items:
+        return func.HttpResponse("Payload missing items", status_code=400)
+
+    # Validate ADT connectivity and model presence
+    try:
+        client = get_adt_client()
+        client.get_model("dtmi:fgcu:traffic:RoadSegment;1")
+    except Exception as e:
+        return func.HttpResponse(f"ADT validation failed: {e}", status_code=500)
+
+    updated = 0
+    errors = 0
+    for item in items:
+        try:
+            lat = float(item.get("lat"))
+            lon = float(item.get("lon"))
+            flow = item.get("data", {}).get("flowSegmentData", {})
+            _adt_upsert_road_segment(client, lat, lon, flow, timestamp)
+            updated += 1
+        except Exception as e:
+            errors += 1
+            if isinstance(e, HttpResponseError):
+                logging.error(
+                    f"ADT upsert failed (status={getattr(e, 'status_code', 'unknown')}): {e.message}"
+                )
+            else:
+                logging.error(f"Failed to upsert twin for item {item}: {e}")
+
+    return func.HttpResponse(json.dumps({"updated": updated, "errors": errors}), mimetype="application/json", status_code=200)
+
+
+# -------------------- ADT diagnostics -------------------- #
+@app.route(route="traffic/adt/diagnose", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def http_adt_diagnose(req: func.HttpRequest) -> func.HttpResponse:
+    """Diagnose ADT connectivity, model presence, and permissions.
+
+    - Checks `ADT_SERVICE_URL` env is set
+    - Connects with managed identity
+    - Verifies model `dtmi:fgcu:traffic:RoadSegment;1` exists
+    - Attempts a test twin upsert and delete
+    Returns a JSON report with statuses and errors.
+    """
+    report = {
+        "adtUrl": os.getenv("ADT_SERVICE_URL", ""),
+        "modelId": "dtmi:fgcu:traffic:RoadSegment;1",
+        "envPresent": bool(os.getenv("ADT_SERVICE_URL")),
+        "connected": False,
+        "modelExists": False,
+        "upsertTest": False,
+        "deleteTest": False,
+        "error": None,
+    }
+
+    try:
+        client = get_adt_client()
+        report["connected"] = True
+        # Check model existence
+        try:
+            client.get_model(report["modelId"])  # will raise if not found
+            report["modelExists"] = True
+        except Exception as me:
+            report["error"] = f"Model check failed: {me}"
+            return func.HttpResponse(json.dumps(report), mimetype="application/json", status_code=200)
+
+        # Try upsert a temporary twin
+        twin_id = "diagnostic_twin_fgcu"
+        twin_body = {
+            "$metadata": {"$model": report["modelId"]},
+            "name": twin_id,
+            "latitude": 26.4666,
+            "longitude": -81.7726,
+            "currentSpeed": 0.0,
+            "freeFlowSpeed": 0.0,
+            "jamFactor": 0.0,
+            "confidence": 0.0,
+            "currentTravelTime": 0,
+            "freeFlowTravelTime": 0,
+            "delayRatio": 0.0,
+            "frc": "",
+            "roadClosure": False,
+            "coordinatesGeoJson": "",
+            "lastUpdatedUtc": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            client.upsert_digital_twin(twin_id, twin_body)
+            report["upsertTest"] = True
+        except Exception as ue:
+            report["error"] = f"Upsert test failed: {ue}"
+            return func.HttpResponse(json.dumps(report), mimetype="application/json", status_code=200)
+
+        # Try delete
+        try:
+            client.delete_digital_twin(twin_id)
+            report["deleteTest"] = True
+        except Exception as de:
+            # Not critical; note error
+            report["error"] = f"Delete test failed: {de}"
+        return func.HttpResponse(json.dumps(report), mimetype="application/json", status_code=200)
+    except Exception as e:
+        report["error"] = str(e)
+        return func.HttpResponse(json.dumps(report), mimetype="application/json", status_code=200)
+

@@ -60,11 +60,25 @@
                          const items = data.items || [];
 
                          items.forEach(item => {
-                              const coords = item.data.flowSegmentData.coordinates.coordinate.map(c => [c.latitude, c.longitude]);
-                              const color = speedColor(item.data.flowSegmentData.currentSpeed, item.data.flowSegmentData.freeFlowSpeed);
+                              const flowData = item.data.flowSegmentData;
+                              const coords = flowData.coordinates.coordinate.map(c => [c.latitude, c.longitude]);
+                              const color = speedColor(flowData.currentSpeed, flowData.freeFlowSpeed);
+
+                              // Build popup content
+                              let popupContent = `
+                            <strong>FRC:</strong> ${flowData.frc}<br>
+                            <strong>Current Speed:</strong> ${flowData.currentSpeed} mph<br>
+                            <strong>Free Flow Speed:</strong> ${flowData.freeFlowSpeed} mph<br>
+                            <strong>Current Travel Time:</strong> ${flowData.currentTravelTime} s<br>
+                            <strong>Free Flow Travel Time:</strong> ${flowData.freeFlowTravelTime} s<br>
+                            <strong>Confidence:</strong> ${flowData.confidence}<br>
+                            <strong>Road Closure:</strong> ${flowData.roadClosure}<br>
+                            <strong>Original Lat/Lon:</strong> ${item.lat}, ${item.lon}<br>
+                            <a href="${item.url}" target="_blank">Segment URL</a>
+                        `;
 
                               L.polyline(coords, { color: color, weight: 4, opacity: 0.7 })
-                                   .bindPopup(`FRC: ${item.data.flowSegmentData.frc}<br>Speed: ${item.data.flowSegmentData.currentSpeed} / ${item.data.flowSegmentData.freeFlowSpeed} mph`)
+                                   .bindPopup(popupContent)
                                    .addTo(map);
                          });
 

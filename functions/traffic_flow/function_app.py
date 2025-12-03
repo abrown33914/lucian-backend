@@ -7,6 +7,7 @@ from typing import List, Tuple
 
 import requests
 import azure.functions as func
+import math
 
 
 app = func.FunctionApp()
@@ -107,6 +108,32 @@ def generate_fgcu_points() -> List[Tuple[float, float]]:
 
     return sorted(list(pts))
 
+def km_to_deg_lat(km: float) -> float:
+    """Approximate conversion near FGCU for latitude degrees."""
+    return km / 111.32
+
+def km_to_deg_lon(km: float, lat: float) -> float:
+    """Longitude degrees scale by cos(latitude)."""
+    return km / (111.32 * math.cos(math.radians(lat)))
+
+def outward_ring_points(center: Tuple[float, float], rings: int, points_per_ring: int, ring_step_km: float) -> List[Tuple[float, float]]:
+    """Generate points in concentric rings around center.
+
+    Each ring has points_per_ring evenly spaced around the circle.
+    """
+    clat, clon = center
+    pts: List[Tuple[float, float]] = []
+    for r in range(1, rings + 1):
+        radius_km = r * ring_step_km
+        dlat = km_to_deg_lat(radius_km)
+        dlon = km_to_deg_lon(radius_km, clat)
+        for k in range(points_per_ring):
+            theta = 2 * math.pi * (k / points_per_ring)
+            lat = clat + dlat * math.sin(theta)
+            lon = clon + dlon * math.cos(theta)
+            pts.append((round(lat, 6), round(lon, 6)))
+    return pts
+
 
 @app.schedule(schedule="0 */5 * * * *", arg_name="timer")
 @app.blob_output(
@@ -129,15 +156,26 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
 
     zoom = int(_get_env("FORT_MYERS_ZOOM", "14"))  # higher zoom = more local detail
 
-    # Generate base sample points near FGCU
+    # Generate base sample points near FGCU and outward rings to expand coverage
     base_points = generate_fgcu_points()
-    logging.info(f"Generated {len(base_points)} FGCU anchor-offset points")
+    center_lat = float(_get_env("FGCU_CENTER_LAT", "26.4666"))
+    center_lon = float(_get_env("FGCU_CENTER_LON", "-81.7726"))
+    rings = int(_get_env("FGCU_RINGS", "6"))
+    points_per_ring = int(_get_env("FGCU_POINTS_PER_RING", "16"))
+    ring_step_km = float(_get_env("FGCU_RING_STEP_KM", "0.5"))
+    ring_points = outward_ring_points((center_lat, center_lon), rings, points_per_ring, ring_step_km)
+    candidate_points = base_points + ring_points
+    logging.info(f"Generated {len(base_points)} anchor-offset points and {len(ring_points)} ring points (total {len(candidate_points)})")
 
     results = []
     failures = 0
     seen_snapped = set()  # avoid duplicate segments for the same snapped coordinate
+    seen_segments = set()  # deduplicate by segment identifier when available
+    target_segments = int(_get_env("FGCU_TARGET_SEGMENTS", "50"))
 
-    for (la, lo) in base_points:
+    for (la, lo) in candidate_points:
+        if len(seen_segments) >= target_segments:
+            break
         # 1) Snap to nearest road
         snap_lat, snap_lon = snap_to_road(la, lo, subscription_key)
 
@@ -161,6 +199,22 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
                     "data": data,
                 }
             )
+            # Try to extract a segment identifier for dedup
+            try:
+                sid = None
+                fsd = data.get("flowSegmentData")
+                if isinstance(fsd, dict):
+                    # Prefer explicit segmentId if present; else fall back to FRC or road class combo
+                    sid = fsd.get("segmentId") or fsd.get("frc") or fsd.get("functionalRoadClass")
+                if sid is None:
+                    # Fallback: short hash of the payload to avoid exact duplicates
+                    sid = (json.dumps(fsd or data)[:64])
+                sid = str(sid)
+                if sid not in seen_segments:
+                    seen_segments.add(sid)
+                    logging.info(f"Added segment {sid} ({len(seen_segments)}/{target_segments})")
+            except Exception as e:
+                logging.debug(f"Segment id extraction failed: {e}")
         except Exception as e:
             failures += 1
             logging.warning(
@@ -181,6 +235,11 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
         "source": "azure-maps-traffic-flow-segment",
         "area": "fgcu_corridor",
         "count": len(results),
+        "uniqueSegmentCount": len(seen_segments),
+        "targetSegments": target_segments,
+        "rings": rings,
+        "pointsPerRing": points_per_ring,
+        "ringStepKm": ring_step_km,
         "failures": failures,
         "items": results,
     }

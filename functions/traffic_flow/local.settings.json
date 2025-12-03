@@ -2,9 +2,9 @@
   "IsEncrypted": false,
   "Values": {
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "ADT_SERVICE_URL": "https://st-adt.api.eus2.digitaltwins.azure.net/",
+    "ADT_SERVICE_URL": "",
     "FUNCTIONS_WORKER_RUNTIME": "python",
-    "AZURE_MAPS_SUBSCRIPTION_KEY": "DZgcIkMbvxyD2zGkroDpoDfpJcBEukbxEslli8V7WYVYP9BdUeX7JQQJ99BLAC8vTInSut1CAAAgAZMP1Jp9",
+    "AZURE_MAPS_SUBSCRIPTION_KEY": "",
     "TRAFFIC_CONTAINER": "traffic-flow",
     "FORT_MYERS_LAT": "26.4515",
     "FORT_MYERS_LON": "-81.8106",

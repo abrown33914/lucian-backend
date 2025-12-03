@@ -312,15 +312,15 @@ lucian-backend/
 
 ## 🚀 **Status**
 
-| Component               | Status          |
-| ----------------------- | --------------- |
+| Component               | Status           |
+| ----------------------- | ---------------  |
 | Azure Maps ingestion    | ✅ Fully working |
 | Blob history storage    | ✅ Working       |
-| RoadSegment twins       | ✔️ Live updated |
-| Traffic forecasting ML  | ✔️ Working      |
-| Pavement aggregation    | ✔️ Working      |
-| Pavement forecasting ML | ✔️ Working      |
-| APIs                    | ✔️ Ready        |
+| RoadSegment twins       | ✅ Live updated  |
+| Traffic forecasting ML  | ✅ Working       |
+| Pavement aggregation    | ✅ Working       |
+| Pavement forecasting ML | ✅ Working       |
+| APIs                    | ✔️ Verifying     |
 
 ---
 

@@ -12,6 +12,8 @@ from azure.digitaltwins.core import DigitalTwinsClient
 from azure.core.exceptions import HttpResponseError
 import math
 
+from azure.storage.blob import BlobServiceClient  # NEW
+
 
 app = func.FunctionApp()
 
@@ -136,13 +138,16 @@ def generate_fgcu_points() -> List[Tuple[float, float]]:
 
     return sorted(list(pts))
 
+
 def km_to_deg_lat(km: float) -> float:
     """Approximate conversion near FGCU for latitude degrees."""
     return km / 111.32
 
+
 def km_to_deg_lon(km: float, lat: float) -> float:
     """Longitude degrees scale by cos(latitude)."""
     return km / (111.32 * math.cos(math.radians(lat)))
+
 
 def outward_ring_points(center: Tuple[float, float], rings: int, points_per_ring: int, ring_step_km: float) -> List[Tuple[float, float]]:
     """Generate points in concentric rings around center.
@@ -218,12 +223,20 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
         url = build_query_url(snap_lat, snap_lon, subscription_key, zoom)
         try:
             data = fetch_with_retries(url)
+
+            # NEW: extract segmentId / roadName from flowSegmentData for storage & later analytics
+            fsd = data.get("flowSegmentData") or {}
+            segment_id = fsd.get("segmentId")
+            road_name = fsd.get("street") or fsd.get("roadName") or fsd.get("description") or ""
+
             results.append(
                 {
                     "lat": snap_lat,
                     "lon": snap_lon,
                     "original": [la, lo],
                     "url": url,
+                    "segmentId": segment_id,      # NEW
+                    "roadName": road_name,        # NEW
                     "data": data,
                 }
             )
@@ -349,7 +362,6 @@ def collect_fort_myers(timer: func.TimerRequest, outblob: func.Out[str]) -> None
         logging.error(f"Inline ADT upsert skipped due to client error: {e}")
 
 
-
 # -------------------- Digital Twins helper -------------------- #
 def get_adt_client() -> DigitalTwinsClient:
     """Create a DigitalTwinsClient using the Function App's managed identity."""
@@ -370,6 +382,11 @@ def _adt_upsert_road_segment(client: DigitalTwinsClient, lat: float, lon: float,
     freeflow_tt = flow.get("freeFlowTravelTime")
     frc = flow.get("frc")
     closure = flow.get("roadClosure")
+
+    # NEW: extract segmentId and roadName from flow data (when present)
+    segment_id = flow.get("segmentId")
+    road_name = flow.get("street") or flow.get("roadName") or flow.get("description") or ""
+
     coords = (flow.get("coordinates") or {}).get("coordinate") or []
     polyline = [[c.get("longitude"), c.get("latitude")] for c in coords if isinstance(c, dict)]
     geojson_line = None
@@ -396,10 +413,12 @@ def _adt_upsert_road_segment(client: DigitalTwinsClient, lat: float, lon: float,
 
     twin_id = f"road_{round(float(lat), 5)}_{round(float(lon), 5)}"
     twin_body = {
-        "$metadata": {"$model": "dtmi:fgcu:traffic:RoadSegment;1"},
+        "$metadata": {"$model": "dtmi:fgcu:traffic:RoadSegment;2"},
         "name": twin_id,
         "latitude": float(lat),
         "longitude": float(lon),
+        "segmentId": str(segment_id) if segment_id is not None else "",  # NEW
+        "roadName": road_name,  # NEW
         "currentSpeed": float(current_speed) if current_speed is not None else 0.0,
         "freeFlowSpeed": float(free_flow_speed) if free_flow_speed is not None else 0.0,
         "jamFactor": float(jam_factor) if jam_factor is not None else 0.0,
@@ -470,10 +489,6 @@ def process_fort_myers_blob(inblob: func.InputStream):
     )
 
 
-
-
-
-
 # -------------------- Diagnosed upsert (validates then upserts) -------------------- #
 @app.route(route="traffic/adt/upsert-diagnosed", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def http_upsert_diagnosed(req: func.HttpRequest) -> func.HttpResponse:
@@ -491,7 +506,7 @@ def http_upsert_diagnosed(req: func.HttpRequest) -> func.HttpResponse:
     # Validate ADT connectivity and model presence
     try:
         client = get_adt_client()
-        client.get_model("dtmi:fgcu:traffic:RoadSegment;1")
+        client.get_model("dtmi:fgcu:traffic:RoadSegment;2")
     except Exception as e:
         return func.HttpResponse(f"ADT validation failed: {e}", status_code=500)
 
@@ -523,13 +538,13 @@ def http_adt_diagnose(req: func.HttpRequest) -> func.HttpResponse:
 
     - Checks `ADT_SERVICE_URL` env is set
     - Connects with managed identity
-    - Verifies model `dtmi:fgcu:traffic:RoadSegment;1` exists
+    - Verifies model `dtmi:fgcu:traffic:RoadSegment;2` exists
     - Attempts a test twin upsert and delete
     Returns a JSON report with statuses and errors.
     """
     report = {
         "adtUrl": os.getenv("ADT_SERVICE_URL", ""),
-        "modelId": "dtmi:fgcu:traffic:RoadSegment;1",
+        "modelId": "dtmi:fgcu:traffic:RoadSegment;2",
         "envPresent": bool(os.getenv("ADT_SERVICE_URL")),
         "connected": False,
         "modelExists": False,
@@ -556,6 +571,8 @@ def http_adt_diagnose(req: func.HttpRequest) -> func.HttpResponse:
             "name": twin_id,
             "latitude": 26.4666,
             "longitude": -81.7726,
+            "segmentId": "",               # NEW: keep in sync with model
+            "roadName": "",                # NEW
             "currentSpeed": 0.0,
             "freeFlowSpeed": 0.0,
             "jamFactor": 0.0,
@@ -586,4 +603,127 @@ def http_adt_diagnose(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         report["error"] = str(e)
         return func.HttpResponse(json.dumps(report), mimetype="application/json", status_code=200)
+    
+
+    # -------------------- Export history from blobs (HTTP) -------------------- #
+@app.route(
+    route="traffic/history/export",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION,
+)
+def http_export_history(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Flatten recent Fort Myers traffic blobs into a CSV (for analytics / ML).
+    Usage:
+      GET /api/traffic/history/export?blobs=50
+
+    - Reads the last N blobs from the TRAFFIC_CONTAINER/fortmyers folder
+    - For each item, outputs one CSV row with key metrics.
+    """
+    try:
+        max_blobs = int(req.params.get("blobs", "50"))
+    except ValueError:
+        max_blobs = 50
+
+    conn_str = os.getenv("AzureWebJobsStorage")
+    if not conn_str:
+        return func.HttpResponse(
+            "AzureWebJobsStorage is not configured.", status_code=500
+        )
+
+    container_name = _get_env("TRAFFIC_CONTAINER", "traffic")
+    prefix = "fortmyers/"
+
+    try:
+        service = BlobServiceClient.from_connection_string(conn_str)
+        container = service.get_container_client(container_name)
+    except Exception as e:
+        return func.HttpResponse(
+            f"Failed to connect to blob container: {e}", status_code=500
+        )
+
+    # List blob names under fortmyers/, newest first
+    try:
+        names = [b.name for b in container.list_blobs(name_starts_with=prefix)]
+        names.sort(reverse=True)
+        names = names[:max_blobs]
+    except Exception as e:
+        return func.HttpResponse(
+            f"Failed to list blobs: {e}", status_code=500
+        )
+
+    import io
+    import csv
+    from datetime import datetime as dt
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # CSV header
+    writer.writerow(
+        [
+            "snapshotTimestamp",
+            "blobName",
+            "twinId",
+            "lat",
+            "lon",
+            "currentSpeed",
+            "freeFlowSpeed",
+            "jamFactor",
+            "currentTravelTime",
+            "freeFlowTravelTime",
+        ]
+    )
+
+    rows = 0
+
+    for name in names:
+        try:
+            blob_bytes = container.download_blob(name).readall()
+            snap = json.loads(blob_bytes)
+        except Exception as e:
+            logging.warning(f"Failed to read blob {name}: {e}")
+            continue
+
+        snap_ts = snap.get("timestamp")
+        items = snap.get("items", [])
+        for item in items:
+            try:
+                lat = float(item.get("lat"))
+                lon = float(item.get("lon"))
+                twin_id = f"road_{round(lat, 5)}_{round(lon, 5)}"
+                flow = (item.get("data") or {}).get("flowSegmentData", {}) or {}
+                current_speed = flow.get("currentSpeed")
+                free_flow_speed = flow.get("freeFlowSpeed")
+                jam_factor = flow.get("jamFactor")
+                current_tt = flow.get("currentTravelTime")
+                freeflow_tt = flow.get("freeFlowTravelTime")
+
+                writer.writerow(
+                    [
+                        snap_ts,
+                        name,
+                        twin_id,
+                        lat,
+                        lon,
+                        current_speed,
+                        free_flow_speed,
+                        jam_factor,
+                        current_tt,
+                        freeflow_tt,
+                    ]
+                )
+                rows += 1
+            except Exception as e:
+                logging.warning(f"Failed to flatten item from {name}: {e}")
+                continue
+
+    csv_text = output.getvalue()
+    logging.info(f"Exported {rows} rows from {len(names)} blobs")
+
+    headers = {
+        "Content-Type": "text/csv",
+        "Content-Disposition": 'attachment; filename="traffic_history_fgcu.csv"',
+    }
+    return func.HttpResponse(csv_text, status_code=200, headers=headers)
 

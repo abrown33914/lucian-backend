@@ -1,0 +1,93 @@
+{
+  "@context": "dtmi:dtdl:context;2",
+  "@id": "dtmi:fgcu:traffic:RoadSegment;2",
+  "@type": "Interface",
+  "displayName": "Road Segment",
+  "description": "FGCU traffic flow segment twin with speeds, travel times, congestion ratio, classification, closure, and geometry.",
+  "contents": [
+    {
+      "@type": "Property",
+      "name": "name",
+      "schema": "string"
+    },
+    {
+      "@type": "Property",
+      "name": "latitude",
+      "schema": "double"
+    },
+    {
+      "@type": "Property",
+      "name": "longitude",
+      "schema": "double"
+    },
+
+    {
+      "@type": "Property",
+      "name": "segmentId",
+      "schema": "string"
+    },
+    {
+      "@type": "Property",
+      "name": "roadName",
+      "schema": "string"
+    },
+
+    {
+      "@type": "Property",
+      "name": "currentSpeed",
+      "schema": "double"
+    },
+    {
+      "@type": "Property",
+      "name": "freeFlowSpeed",
+      "schema": "double"
+    },
+    {
+      "@type": "Property",
+      "name": "jamFactor",
+      "schema": "double"
+    },
+    {
+      "@type": "Property",
+      "name": "confidence",
+      "schema": "double"
+    },
+    {
+      "@type": "Property",
+      "name": "currentTravelTime",
+      "schema": "integer"
+    },
+    {
+      "@type": "Property",
+      "name": "freeFlowTravelTime",
+      "schema": "integer"
+    },
+    {
+      "@type": "Property",
+      "name": "delayRatio",
+      "schema": "double"
+    },
+    {
+      "@type": "Property",
+      "name": "frc",
+      "schema": "string"
+    },
+    {
+      "@type": "Property",
+      "name": "roadClosure",
+      "schema": "boolean"
+    },
+    {
+      "@type": "Property",
+      "name": "coordinatesGeoJson",
+      "schema": "string",
+      "description": "GeoJSON LineString string of the segment geometry (WGS84)."
+    },
+    {
+      "@type": "Property",
+      "name": "lastUpdatedUtc",
+      "schema": "string",
+      "description": "ISO 8601 UTC timestamp of last update."
+    }
+  ]
+}

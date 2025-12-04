@@ -4,6 +4,8 @@
 
 ### *Azure Digital Twins • Azure Functions • Azure Maps • Machine Learning*
 
+[🎬 Demo Video — Watch the demo](https://www.youtube.com/watch?v=JyVM-xs5sAs)  
+
 ---
 
 ## 📌 **Overview**

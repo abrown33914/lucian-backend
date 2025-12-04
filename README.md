@@ -246,18 +246,27 @@ PAVEMENT_MODEL_BLOB=pavement_model.joblib
 
 ---
 
-## 🔥 **API Endpoints (Complete)**
+## 🔥 **API Endpoints**
 
-### **Traffic APIs**
-needs filled
+Base URL locally: `http://localhost:7071/api`.
 
----
+### Traffic APIs (Blob-backed)
+- `/traffic/latest` — Latest snapshot summary and `items` array.
+- `/traffic/history?limit=10` — Recent snapshot summaries.
+- `/traffic/forecast?window=5&limit=5` — Simple local forecast values.
+- `/traffic/summary` — Aggregated metrics over blobs.
 
-### **Pavement APIs**
-needs filled
+### ADT-backed APIs
+- `/traffic/adt/latest` — Summary computed from RoadSegment twins.
+- `/traffic/adt/history` — History view from ADT twins.
+- `/traffic/adt/prediction` — ADT-derived prediction with fallback.
+- `/traffic/adt/points?bbox=lat1,lon1,lat2,lon2&limit=100` — Geospatial points for mapping; supports bbox+limit.
 
+### Pavement APIs
+- `/pavement/aggregate` — Aggregates metrics and upserts PavementSegment twins.
+- `/pavement/forecast/local-ml` — Predicts pavement stress and condition; upserts PavementForecast twins.
 
----
+Note: Some pavement endpoints may be timer-triggered and also expose manual HTTP routes depending on your configuration.
 
 ## 🖥️ **Digital Twins Explorer Queries**
 
@@ -292,12 +301,13 @@ SELECT * FROM digitaltwins t WHERE IS_OF_MODEL(t, 'dtmi:fgcu:traffic:PavementFor
 ```
 lucian-backend/
 │
-├── azure-functions/
-│   └── __init__.py   (all triggers & APIs)
+├── functions/
+│   └── traffic_flow/
+│       ├── function_app.py      (all triggers & APIs consolidated)
+│       └── requirements.txt
 │
-├── models/
-│   ├── traffic_model.joblib
-│   └── pavement_model.joblib
+├── untitled-traffic.html        (dashboard with KPIs + map)
+├── FinalReport.md               (project final report)
 │
 ├── scripts/
 │   ├── prepare_traffic_training.py

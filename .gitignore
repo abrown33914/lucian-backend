@@ -4,3 +4,4 @@ __pycache__/
 local.settings.json
 .vscode/
 functions/**/local.settings.json
+functions/traffic_flow/local.settings.json

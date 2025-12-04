@@ -4,6 +4,8 @@
 
 ### *Azure Digital Twins • Azure Functions • Azure Maps • Machine Learning*
 
+[🎬 Demo Video — Watch the demo](https://www.youtube.com/watch?v=JyVM-xs5sAs)  
+
 ---
 
 ## 📌 **Overview**
@@ -246,27 +248,28 @@ PAVEMENT_MODEL_BLOB=pavement_model.joblib
 
 ---
 
-## 🔥 **API Endpoints**
 
-Base URL locally: `http://localhost:7071/api`.
 
-### Traffic APIs (Blob-backed)
-- `/traffic/latest` — Latest snapshot summary and `items` array.
-- `/traffic/history?limit=10` — Recent snapshot summaries.
-- `/traffic/forecast?window=5&limit=5` — Simple local forecast values.
-- `/traffic/summary` — Aggregated metrics over blobs.
+## 🔥 **API Endpoints (Implemented)**
 
-### ADT-backed APIs
-- `/traffic/adt/latest` — Summary computed from RoadSegment twins.
-- `/traffic/adt/history` — History view from ADT twins.
-- `/traffic/adt/prediction` — ADT-derived prediction with fallback.
-- `/traffic/adt/points?bbox=lat1,lon1,lat2,lon2&limit=100` — Geospatial points for mapping; supports bbox+limit.
+### **Traffic / ADT Management APIs**
 
-### Pavement APIs
-- `/pavement/aggregate` — Aggregates metrics and upserts PavementSegment twins.
-- `/pavement/forecast/local-ml` — Predicts pavement stress and condition; upserts PavementForecast twins.
+- `GET /api/traffic/adt/diagnose`
+        - Purpose: Validate ADT connectivity, verify the `RoadSegment` model exists, and perform a small
+                upsert/delete test to confirm permissions and connectivity. Returns a JSON diagnostic report.
 
-Note: Some pavement endpoints may be timer-triggered and also expose manual HTTP routes depending on your configuration.
+- `POST /api/traffic/adt/upsert-diagnosed`
+        - Purpose: Accepts a collector-style payload (the same shape produced by the timer collector)
+                and upserts `RoadSegment` twins into ADT. Useful for manual testing or replaying snapshot blobs.
+
+Notes: The front-end dashboard includes calls to additional endpoints (e.g. `/traffic/latest`,
+`/traffic/forecast`, `/traffic/history`, `/traffic/adt/points`, `/traffic/adt/prediction`) but these
+routes are not implemented as HTTP functions in the current `function_app.py`. Collection is handled
+by a timer trigger and processing by a blob trigger; we can add HTTP endpoints to expose those
+behaviors on demand if desired.
+
+---
+---
 
 ## 🖥️ **Digital Twins Explorer Queries**
 
@@ -336,6 +339,4 @@ lucian-backend/
 
 ## ✔️ **Next Steps**
 
-* Ensure API's are accesible for frontend team
-* Add relationship modeling
 * Include cost analysis section
